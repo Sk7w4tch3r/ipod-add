@@ -62,7 +62,7 @@ ipod-add --title "Official Trailer" trailer.mkv
 ipod-add --album "Vacation" photo.webp
 ```
 
-The iPod is auto-detected below `/media/$USER`. Use `--mount` when it is
+The iPod is auto-detected below `/media/$USER` and `/run/media/$USER`. Use `--mount` when it is
 mounted somewhere else:
 
 ```bash

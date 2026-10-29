@@ -23,9 +23,9 @@ static int report_error(GError *error, const char *context) {
     return 1;
 }
 
-static gchar *find_mount(void) {
+static gchar *find_mount_under(const gchar *root) {
     const gchar *user = g_get_user_name();
-    gchar *base = g_build_filename("/media", user, NULL);
+    gchar *base = g_build_filename(root, user, NULL);
     GDir *dir = g_dir_open(base, 0, NULL);
     if (!dir) {
         g_free(base);
@@ -48,6 +48,11 @@ static gchar *find_mount(void) {
     g_dir_close(dir);
     g_free(base);
     return found;
+}
+
+static gchar *find_mount(void) {
+    gchar *mount = find_mount_under("/media");
+    return mount ? mount : find_mount_under("/run/media");
 }
 
 static gchar *value_from_probe(const gchar *output, const gchar *wanted) {
@@ -108,8 +113,8 @@ int main(int argc, char **argv) {
     }
     if (!mount) mount = find_mount();
     if (!mount) {
-        fprintf(stderr, "ipod-add: no mounted iPod was found under /media/%s\n",
-                g_get_user_name());
+        fprintf(stderr, "ipod-add: no mounted iPod was found under /media/%s or /run/media/%s; use --mount PATH\n",
+                g_get_user_name(), g_get_user_name());
         return 1;
     }
 

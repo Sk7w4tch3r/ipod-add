@@ -33,6 +33,11 @@ ffmpeg -hide_banner -loglevel error -y \
 
 converted=$(IPOD_ADD_REAL=$backend IPOD_TIME_SYNC_HELPER=/bin/true \
     IPOD_ADD_EXPECT_SUFFIX=.mp3 "$wrapper" "$tmp_dir/tone.flac")
+grep -q 'backend <--title> <tone>' <<<"$converted"
 grep -Eq '/tmp/ipod-add\.[^>]+\.mp3>' <<<"$converted"
+
+explicit=$(IPOD_ADD_REAL=$backend IPOD_TIME_SYNC_HELPER=/bin/true \
+    "$wrapper" --title "My title" "$tmp_dir/tone.flac")
+grep -q 'backend <--title> <My title>' <<<"$explicit"
 
 printf 'wrapper tests passed\n'
