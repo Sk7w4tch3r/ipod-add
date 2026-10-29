@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
+set -euo pipefail
+
+script_path=$(readlink -f -- "${BASH_SOURCE[0]}")
+prefix=$(cd -- "$(dirname -- "$script_path")/.." && pwd -P)
+readonly REAL_IPOD_ADD="${IPOD_ADD_REAL:-$prefix/libexec/ipod-add-core}"
+readonly CLOCK_HELPER="${IPOD_TIME_SYNC_HELPER:-$prefix/libexec/ipod-time-sync-safe}"
+
+show_help() {
+    cat <<'EOF'
+Usage:
+  ipod-add [OPTIONS] FILE
+
+Add audio, video, or an image to the mounted iPod and update its Apple UI
+database through libgpod. The media type is detected automatically. After each
+successful transfer, the iPod clock is synchronized to the host's local time,
+timezone offset, and daylight-saving state.
+
+Options:
+  --mount PATH       Use this iPod mount instead of auto-detecting it
+  --title TEXT       Override the displayed audio/video title
+  --artist TEXT      Override the displayed artist or creator
+  --album TEXT       Set the audio album or destination photo album
+  --music            Force audio to appear as music
+  --audiobook        Force audio to appear as an audiobook
+  --video            Force video handling
+  --photo            Force image handling
+  -h, --help         Show this help
+
+Automatic compatibility handling:
+  Audio   Incompatible formats such as FLAC/OGG are converted to 192 kb/s MP3.
+  Video   Incompatible containers/codecs/resolutions are converted to an
+          iPod-safe MP4: H.264 Baseline Level 3.0, up to 640x480 and 30 fps,
+          with AAC stereo audio.
+  Photos  JPEG/PNG/TIFF/BMP/GIF are imported directly. Other recognized image
+          formats such as WebP/HEIC/AVIF are converted to JPEG first.
+
+Files created only for conversion are deleted automatically after the import.
+
+Examples:
+  ipod-add song.flac
+  ipod-add --audiobook --title "The Odyssey" audiobook.ogg
+  ipod-add --title "Official Trailer" trailer.mkv
+  ipod-add --album "Vacation" photo.webp
+EOF
+}
+
+die() {
+    printf 'ipod-add: %s\n' "$*" >&2
+    exit 1
+}
+
+sync_ipod_clock() {
+    if [[ ! -x "$CLOCK_HELPER" ]]; then
+        printf 'ipod-add: warning: safe iPod clock helper is not installed; clock was not updated\n' >&2
+        return 0
+    fi
+    if "$CLOCK_HELPER"; then
+        printf 'ipod-add: iPod clock synchronized to %s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S %Z (%z)')" >&2
+    else
+        printf 'ipod-add: warning: media transferred, but iPod clock synchronization failed\n' >&2
+    fi
+}
+
+args=("$@")
+input_index=-1
+media_kind=
+mount_path=
+
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[i]}" in
+        --video) media_kind=video ;;
+        --music|--audiobook) media_kind=audio ;;
+        --photo) media_kind=photo ;;
+        --mount)
+            ((i += 1))
+            ((i < ${#args[@]})) || die "--mount requires a path"
+            mount_path=${args[i]}
+            ;;
+        --title|--artist|--album)
+            ((i += 1))
+            ((i < ${#args[@]})) || die "${args[i - 1]} requires a value"
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --*)
+            ;;
+        *)
+            input_index=$i
+            ;;
+    esac
+done
+
+((input_index >= 0)) || {
+    show_help >&2
+    exit 2
+}
+input=${args[input_index]}
+[[ -f "$input" ]] || exec "$REAL_IPOD_ADD" "${args[@]}"
+
+command -v ffprobe >/dev/null 2>&1 ||
+    die "ffprobe is required to inspect media files"
+
+if [[ -z "$mount_path" ]]; then
+    for candidate in "/media/${USER:-$(id -un)}"/*; do
+        if [[ -f "$candidate/iPod_Control/iTunes/iTunesDB" ]]; then
+            mount_path=$candidate
+            break
+        fi
+    done
+fi
+
+if [[ -z "$media_kind" ]]; then
+    inferred_extension=${input##*.}
+    inferred_extension=${inferred_extension,,}
+    case "$inferred_extension" in
+        jpg|jpeg|png|tif|tiff|bmp|gif|webp|heic|heif|avif)
+            media_kind=photo
+            ;;
+        *)
+            if ffprobe -v error -select_streams v:0 \
+                -show_entries stream=codec_type \
+                -of default=noprint_wrappers=1:nokey=1 -- "$input" |
+                grep -qx video; then
+                media_kind=video
+            elif ffprobe -v error -select_streams a:0 \
+                -show_entries stream=codec_type \
+                -of default=noprint_wrappers=1:nokey=1 -- "$input" |
+                grep -qx audio; then
+                media_kind=audio
+            else
+                die "could not identify '$input' as audio, video, or an image"
+            fi
+            ;;
+    esac
+fi
+
+converted=
+
+if [[ "$media_kind" == video ]]; then
+    video_codec=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name \
+        -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null || true)
+    video_profile=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=profile \
+        -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null || true)
+    video_level=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=level \
+        -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null || true)
+    video_pix_fmt=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=pix_fmt \
+        -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null || true)
+    video_width=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=width \
+        -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null || true)
+    video_height=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=height \
+        -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null || true)
+    video_fps=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=avg_frame_rate \
+        -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null || true)
+    audio_codec=$(ffprobe -v error -select_streams a:0 \
+        -show_entries stream=codec_name \
+        -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null || true)
+    extension=${input##*.}
+    extension=${extension,,}
+
+    fps_ok=$(awk -v rate="$video_fps" 'BEGIN {
+        split(rate, p, "/"); if (p[2] == 0 || p[2] == "") exit 1;
+        exit !((p[1] / p[2]) <= 30.01)
+    }' && printf yes || printf no)
+    if [[ ! "$extension" =~ ^(mp4|m4v|mov)$ ||
+          "$video_codec" != h264 ||
+          ! "$video_profile" =~ ^(Baseline|Constrained\ Baseline)$ ||
+          ! "$video_level" =~ ^[0-9]+$ || "$video_level" -gt 30 ||
+          "$video_pix_fmt" != yuv420p ||
+          ! "$video_width" =~ ^[0-9]+$ || "$video_width" -gt 640 ||
+          ! "$video_height" =~ ^[0-9]+$ || "$video_height" -gt 480 ||
+          "$fps_ok" != yes ||
+          (-n "$audio_codec" && "$audio_codec" != aac) ]]; then
+        command -v ffmpeg >/dev/null 2>&1 ||
+            die "ffmpeg is required to convert incompatible video"
+        converted=$(mktemp --suffix=.mp4 /tmp/ipod-add.XXXXXX)
+        trap 'rm -f -- "$converted"' EXIT HUP INT TERM
+        printf 'ipod-add: converting %s to iPod-compatible H.264/AAC...\n' "$input" >&2
+        if ! ffmpeg -hide_banner -loglevel error -stats -y -i "$input" \
+            -map 0:v:0 -map '0:a:0?' \
+            -c:v libx264 -profile:v baseline -level 3.0 -pix_fmt yuv420p \
+            -vf "scale='min(640,iw)':'min(480,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" \
+            -r 30 -g 60 -crf 21 -maxrate 2500k -bufsize 5000k \
+            -c:a aac -b:a 160k -ac 2 -ar 44100 \
+            -movflags +faststart "$converted"; then
+            command -v mpv >/dev/null 2>&1 ||
+                die "video conversion failed (no decoder is available)"
+            printf 'ipod-add: FFmpeg could not decode it; retrying with MPV...\n' >&2
+            rm -f -- "$converted"
+            mpv --no-config --no-terminal --audio-channels=stereo \
+                --vf=scale=w=640:h=480:force_original_aspect_ratio=decrease \
+                --of=mp4 --ovc=libx264 \
+                --ovcopts-add=profile=baseline,level=3.0,pix_fmt=yuv420p,crf=21 \
+                --oac=aac --oacopts-add=b=160k \
+                --o="$converted" -- "$input" ||
+                die "video conversion failed"
+        fi
+        args[input_index]=$converted
+    fi
+elif [[ "$media_kind" == audio ]]; then
+    audio_codec=$(ffprobe -v error -select_streams a:0 \
+        -show_entries stream=codec_name \
+        -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null || true)
+    extension=${input##*.}
+    extension=${extension,,}
+    compatible_audio=no
+    case "$audio_codec:$extension" in
+        mp3:mp3|aac:m4a|aac:m4b|aac:mp4|alac:m4a|pcm_*:wav|pcm_*:aif|pcm_*:aiff)
+            compatible_audio=yes
+            ;;
+    esac
+    if [[ "$compatible_audio" != yes ]]; then
+        command -v ffmpeg >/dev/null 2>&1 ||
+            die "ffmpeg is required to convert incompatible audio"
+        converted=$(mktemp --suffix=.mp3 /tmp/ipod-add.XXXXXX)
+        trap 'rm -f -- "$converted"' EXIT HUP INT TERM
+        printf 'ipod-add: converting %s to iPod-compatible MP3...\n' "$input" >&2
+        ffmpeg -hide_banner -loglevel error -stats -y -i "$input" \
+            -map '0:a:0' -vn -c:a libmp3lame -b:a 192k -ar 44100 \
+            "$converted" ||
+            die "audio conversion failed"
+        args[input_index]=$converted
+    fi
+elif [[ "$media_kind" == photo ]]; then
+    extension=${input##*.}
+    extension=${extension,,}
+    if [[ ! "$extension" =~ ^(jpg|jpeg|png|tif|tiff|bmp|gif)$ ]]; then
+        command -v convert >/dev/null 2>&1 ||
+            die "ImageMagick is required to convert this image"
+        converted=$(mktemp --suffix=.jpg /tmp/ipod-add.XXXXXX)
+        trap 'rm -f -- "$converted"' EXIT HUP INT TERM
+        printf 'ipod-add: converting %s to iPod-compatible JPEG...\n' "$input" >&2
+        convert "${input}[0]" -auto-orient -quality 92 "$converted" ||
+            die "image conversion failed"
+        args[input_index]=$converted
+    fi
+fi
+
+if [[ -n "$converted" ]]; then
+    set +e
+    "$REAL_IPOD_ADD" "${args[@]}"
+    status=$?
+    set -e
+    if ((status == 0)) && [[ -n "$mount_path" ]]; then
+        sync_ipod_clock "$mount_path"
+    fi
+    exit "$status"
+fi
+
+set +e
+"$REAL_IPOD_ADD" "${args[@]}"
+status=$?
+set -e
+if ((status == 0)) && [[ -n "$mount_path" ]]; then
+    sync_ipod_clock "$mount_path"
+fi
+exit "$status"
